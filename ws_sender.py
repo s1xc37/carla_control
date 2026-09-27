@@ -92,7 +92,7 @@ class Observer:
             return "MAIN"
         return "PED"
 
-    def _type(self, v):
+    def vtype(self, v):
         t = self.types.get(v.id)
         if t is None:
             a = v.attributes
@@ -102,20 +102,39 @@ class Observer:
             self.types[v.id] = t
         return t
 
-    def vehicles(self):
-        lo = self.lanes[0][0] - self.lanes[0][1] / 2           # коридор 4 полос поперёк
+    def _bounds(self):
+        """Коридор нашей дороги: поперёк (от торца W) и вдоль (от центра зебры), м."""
+        lo = self.lanes[0][0] - self.lanes[0][1] / 2
         hi = self.lanes[-1][0] + self.lanes[-1][1] / 2
+        return lo, hi, -(self.half + ZEBRA_MARGIN), ROAD_LENGTH
+
+    def lane_of(self, p):
+        """(номер полосы 1–4, направление), если точка в коридоре нашей дороги, иначе None."""
+        lo, hi, b_lo, b_hi = self._bounds()
+        a = self._dot(p, self.g.ends["W"], self.u)              # поперёк дороги
+        b = self._dot(p, self.center, self.n)                   # вдоль дороги от зебры
+        if not (lo <= a <= hi and b_lo <= b <= b_hi):
+            return None
+        i = min(range(len(self.lanes)), key=lambda k: abs(self.lanes[k][0] - a))
+        return i + 1, self.lanes[i][2]
+
+    def corridor(self):
+        """Углы коридора в координатах мира — для отрисовки."""
+        lo, hi, b_lo, b_hi = self._bounds()
+        w, (ux, uy), (nx, ny) = self.g.ends["W"], self.u, self.n
+        b0 = self._dot(w, self.center, self.n)                  # торец W относительно центра вдоль дороги
+        return [(w.x + ux * a + nx * (b - b0), w.y + uy * a + ny * (b - b0))
+                for a, b in ((lo, b_lo), (hi, b_lo), (hi, b_hi), (lo, b_hi))]
+
+    def vehicles(self):
         out = []
         for v in self.world.get_actors().filter("vehicle.*"):
-            p = v.get_location()
-            a = self._dot(p, self.g.ends["W"], self.u)          # поперёк дороги
-            b = self._dot(p, self.center, self.n)               # вдоль дороги от зебры
-            if not (lo <= a <= hi and -(self.half + ZEBRA_MARGIN) <= b <= ROAD_LENGTH):
+            lane = self.lane_of(v.get_location())
+            if lane is None:
                 continue
-            i = min(range(len(self.lanes)), key=lambda k: abs(self.lanes[k][0] - a))
             vel = v.get_velocity()
-            out.append({"id": v.id, "type": self._type(v), "lane": i + 1,
-                        "direction": self.lanes[i][2],
+            out.append({"id": v.id, "type": self.vtype(v), "lane": lane[0],
+                        "direction": lane[1],
                         "speed_kmh": round(math.hypot(vel.x, vel.y) * 3.6, 1)})
         return out
 
