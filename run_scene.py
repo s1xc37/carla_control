@@ -1,6 +1,7 @@
 import math
 import random
 import carla
+from pedestrians import Pedestrians
 
 # ---- конфиг ----
 CW_CENTER = carla.Location(x=32.3, y=-178.5, z=0.0)  # центр зебры
@@ -10,7 +11,7 @@ VEH_PER_HOUR = 1200           # интенсивность суммарно по
 MAX_VEHICLES = 60             # потолок, чтобы не задушить сервер
 SEED = 42
 DT = 0.05
-PHASES = [("MAIN", 20.0), ("SIDE", 15.0), ("PED", 10.0)]
+PHASES = [("MAIN", 20.0), ("SIDE", 15.0), ("PED", 20.0)]  # PED >= время перехода (~14–18 с)
 
 G, R = carla.TrafficLightState.Green, carla.TrafficLightState.Red
 random.seed(SEED)
@@ -24,6 +25,7 @@ world = client.get_world()
 tm = client.get_trafficmanager()
 tm.set_random_device_seed(SEED)
 vehicles = []
+peds = None
 
 try:
     s = world.get_settings()
@@ -46,6 +48,9 @@ try:
     for tl in lights:
         if tl.id not in group_ids:
             tl.set_state(G)
+
+    # ---- пешеходы (до спавна: cross_factor и точки ожидания) ----
+    peds = Pedestrians(world, client, CW_CENTER, SEED)
 
     world.get_spectator().set_transform(carla.Transform(
         CW_CENTER + carla.Location(z=60), carla.Rotation(pitch=-89)))
@@ -104,6 +109,8 @@ try:
             t_phase = 0.0
             apply_phase(PHASES[phase_i][0])
 
+        peds.update(t, PHASES[phase_i][0], PHASES[phase_i][1] - t_phase)
+
         # источник
         if t >= next_spawn:
             if len(vehicles) < MAX_VEHICLES and try_spawn():
@@ -133,10 +140,18 @@ try:
             print(f"[{PHASES[phase_i][0]:4} {t_phase:4.0f}s] наш={our.state}  "
                   f"в зоне={len(vehicles):3}  ждут у нас={waiting:2}  "
                   f"+{spawned} -{removed} (не влезло {blocked})")
+            # спрос пешеходов — данные для контроллера (пока цикл фиксированный)
+            demand = peds.demand(t)
+            print(peds.stats_line(demand))
 
 except KeyboardInterrupt:
     print("\nОстановка...")
 finally:
+    if peds:
+        try:
+            peds.destroy()
+        except RuntimeError as e:  # уборка мира ниже должна пройти в любом случае
+            print(f"Уборка пешеходов упала: {e}")
     client.apply_batch([carla.command.DestroyActor(x) for x in vehicles])
     world.freeze_all_traffic_lights(False)
     tm.set_synchronous_mode(False)
