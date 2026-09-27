@@ -16,6 +16,7 @@ import math
 import random
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import carla
 
@@ -97,6 +98,64 @@ def sidewalk_line(cmap, a, b):
     return True
 
 
+def find_geometry(cmap, center, log=print):
+    """Зебра у center: контур, торцы W/E, точки ожидания, оси, края полос.
+    Общая для pedestrians.py и ws_sender.py — зоны и там и там одни и те же."""
+    g = SimpleNamespace()
+    g.zebra = find_zebra(cmap, center)
+    pl = g.zebra
+    if len(pl) != 4:
+        raise RuntimeError(f"Ожидал 4-угольную зебру, а в ней {len(pl)} точек")
+    # торцы = две самые короткие стороны, берём их середины
+    edges = sorted(((pl[i], pl[(i + 1) % 4]) for i in range(4)), key=lambda e: d2(*e))[:2]
+    ends = [carla.Location((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2) for a, b in edges]
+    ends.sort(key=lambda e: e.x)   # условные имена: W — торец с меньшим x
+    g.ends = {"W": ends[0], "E": ends[1]}
+    L = d2(*ends)
+    ux, uy = (ends[1].x - ends[0].x) / L, (ends[1].y - ends[0].y) / L
+    g.normal = (-uy, ux)        # поперёк зебры
+    log(f"Зебра: длина {L:.1f} м, торцы W=({ends[0].x:.2f}, {ends[0].y:.2f}) "
+          f"E=({ends[1].x:.2f}, {ends[1].y:.2f})")
+
+    g.wait, g.out = {}, {}
+    for s in ("W", "E"):
+        e, o = g.ends[s], g.ends[OTHER[s]]
+        g.out[s] = ((e.x - o.x) / L, (e.y - o.y) / L)       # от зебры наружу
+        p = carla.Location(e.x + g.out[s][0] * WAIT_OFFSET,
+                           e.y + g.out[s][1] * WAIT_OFFSET, e.z)
+        if on_sidewalk(cmap, p):
+            g.wait[s] = p
+            log(f"  {s}: ожидание ({p.x:.2f}, {p.y:.2f}) — на тротуаре")
+            continue
+        wp = cmap.get_waypoint(p, project_to_road=True, lane_type=carla.LaneType.Sidewalk)
+        if wp is None or d2(wp.transform.location, p) > WAIT_SNAP_MAX:
+            raise RuntimeError(f"{s}: у торца нет тротуара ближе {WAIT_SNAP_MAX} м")
+        # от торца к центру полосы тротуара: первая точка на тротуаре + 0.5 м вглубь
+        c = wp.transform.location
+        n = d2(e, c)
+        k = next(k for k in range(int(n / 0.1) + 1) if on_sidewalk(cmap, carla.Location(
+            e.x + (c.x - e.x) * k * 0.1 / n, e.y + (c.y - e.y) * k * 0.1 / n, e.z)))
+        f = min(1.0, (k * 0.1 + 0.5) / n)
+        q = carla.Location(e.x + (c.x - e.x) * f, e.y + (c.y - e.y) * f, c.z)
+        g.wait[s] = q
+        log(f"  {s}: ожидание ({q.x:.2f}, {q.y:.2f}) — ПРИВЯЗАНА к краю тротуара "
+              f"road={wp.road_id} lane={wp.lane_id}: расчётная точка ({p.x:.2f}, {p.y:.2f}) "
+              f"не на тротуаре, до торца {d2(q, e):.1f} м")
+
+    # край проезжей части вдоль оси зебры: идём от торца внутрь, пока не попадём на полосу
+    g.stop = {}
+    for s in ("W", "E"):
+        e, (ox, oy) = g.ends[s], g.out[s]
+        k = next(k for k in range(int(L / 0.1)) if on_road(cmap, carla.Location(
+            e.x - ox * k * 0.1, e.y - oy * k * 0.1, e.z)))
+        inset = max(0.0, k * 0.1 - ROAD_CLEAR)
+        g.stop[s] = carla.Location(e.x - ox * inset, e.y - oy * inset, e.z)
+        log(f"  {s}: край полос в {k * 0.1:.1f} м от торца, переход сюда заканчивается "
+              f"в {inset:.1f} м от торца")
+    g.length = L
+    return g
+
+
 @dataclass
 class PedDemand:
     """Спрос на пешеходную фазу — только числа, без акторов CARLA."""
@@ -155,56 +214,9 @@ class Pedestrians:
 
     # ---- геометрия ----
     def _find_geometry(self):
-        self.zebra = find_zebra(self.cmap, self.center)
-        pl = self.zebra
-        if len(pl) != 4:
-            raise RuntimeError(f"Ожидал 4-угольную зебру, а в ней {len(pl)} точек")
-        # торцы = две самые короткие стороны, берём их середины
-        edges = sorted(((pl[i], pl[(i + 1) % 4]) for i in range(4)), key=lambda e: d2(*e))[:2]
-        ends = [carla.Location((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2) for a, b in edges]
-        ends.sort(key=lambda e: e.x)   # условные имена: W — торец с меньшим x
-        self.ends = {"W": ends[0], "E": ends[1]}
-        L = d2(*ends)
-        ux, uy = (ends[1].x - ends[0].x) / L, (ends[1].y - ends[0].y) / L
-        self.normal = (-uy, ux)        # поперёк зебры
-        print(f"Зебра: длина {L:.1f} м, торцы W=({ends[0].x:.2f}, {ends[0].y:.2f}) "
-              f"E=({ends[1].x:.2f}, {ends[1].y:.2f})")
-
-        self.wait, self.out = {}, {}
-        for s in ("W", "E"):
-            e, o = self.ends[s], self.ends[OTHER[s]]
-            self.out[s] = ((e.x - o.x) / L, (e.y - o.y) / L)       # от зебры наружу
-            p = carla.Location(e.x + self.out[s][0] * WAIT_OFFSET,
-                               e.y + self.out[s][1] * WAIT_OFFSET, e.z)
-            if on_sidewalk(self.cmap, p):
-                self.wait[s] = p
-                print(f"  {s}: ожидание ({p.x:.2f}, {p.y:.2f}) — на тротуаре")
-                continue
-            wp = self.cmap.get_waypoint(p, project_to_road=True, lane_type=carla.LaneType.Sidewalk)
-            if wp is None or d2(wp.transform.location, p) > WAIT_SNAP_MAX:
-                raise RuntimeError(f"{s}: у торца нет тротуара ближе {WAIT_SNAP_MAX} м")
-            # от торца к центру полосы тротуара: первая точка на тротуаре + 0.5 м вглубь
-            c = wp.transform.location
-            n = d2(e, c)
-            k = next(k for k in range(int(n / 0.1) + 1) if on_sidewalk(self.cmap, carla.Location(
-                e.x + (c.x - e.x) * k * 0.1 / n, e.y + (c.y - e.y) * k * 0.1 / n, e.z)))
-            f = min(1.0, (k * 0.1 + 0.5) / n)
-            q = carla.Location(e.x + (c.x - e.x) * f, e.y + (c.y - e.y) * f, c.z)
-            self.wait[s] = q
-            print(f"  {s}: ожидание ({q.x:.2f}, {q.y:.2f}) — ПРИВЯЗАНА к краю тротуара "
-                  f"road={wp.road_id} lane={wp.lane_id}: расчётная точка ({p.x:.2f}, {p.y:.2f}) "
-                  f"не на тротуаре, до торца {d2(q, e):.1f} м")
-
-        # край проезжей части вдоль оси зебры: идём от торца внутрь, пока не попадём на полосу
-        self.stop = {}
-        for s in ("W", "E"):
-            e, (ox, oy) = self.ends[s], self.out[s]
-            k = next(k for k in range(int(L / 0.1)) if on_road(self.cmap, carla.Location(
-                e.x - ox * k * 0.1, e.y - oy * k * 0.1, e.z)))
-            inset = max(0.0, k * 0.1 - ROAD_CLEAR)
-            self.stop[s] = carla.Location(e.x - ox * inset, e.y - oy * inset, e.z)
-            print(f"  {s}: край полос в {k * 0.1:.1f} м от торца, переход сюда заканчивается "
-                  f"в {inset:.1f} м от торца")
+        g = find_geometry(self.cmap, self.center)
+        self.zebra, self.ends, self.wait = g.zebra, g.ends, g.wait
+        self.out, self.normal, self.stop = g.out, g.normal, g.stop
 
         for s in ("W", "E"):
             n = path_len(self.wait[s], [self.ends[s], self.stop[OTHER[s]]])
