@@ -2,6 +2,7 @@ import math
 import random
 import signal
 import carla
+import control
 from envconf import CARLA_HOST, CARLA_MAP, CARLA_PORT, env
 from pedestrians import Pedestrians
 
@@ -43,6 +44,7 @@ tm = client.get_trafficmanager(TM_PORT)
 tm.set_random_device_seed(SEED)
 vehicles = []
 peds = None
+ctl = None
 
 try:
     s = world.get_settings()
@@ -68,6 +70,11 @@ try:
 
     # ---- пешеходы (до спавна: cross_factor и точки ожидания) ----
     peds = Pedestrians(world, client, CW_CENTER, SEED)
+    try:  # ползунки debug_view.py
+        ctl = control.Server()
+        print(f"Управление для debug_view.py: udp {control.CONTROL_HOST}:{control.CONTROL_PORT}")
+    except OSError as e:
+        print(f"Управление недоступно ({e}) — сцена работает без ползунков")
 
     world.get_spectator().set_transform(carla.Transform(
         CW_CENTER + carla.Location(z=60), carla.Rotation(pitch=-89)))
@@ -100,8 +107,13 @@ try:
                 return True
         return False  # все источники заняты — очередь доползла до спавна
 
-    rate = VEH_PER_HOUR / 3600.0              # машин в секунду
-    next_spawn = random.expovariate(rate)     # пуассоновский поток
+    veh_per_hour, max_vehicles = VEH_PER_HOUR, MAX_VEHICLES   # меняются ползунками debug_view.py
+
+    def next_car(now):
+        """Время следующей машины: пуассоновский поток; 0 машин/ч — никогда."""
+        return now + random.expovariate(veh_per_hour / 3600.0) if veh_per_hour > 0 else math.inf
+
+    next_spawn = next_car(0.0)
 
     # ---- фазы ----
     def apply_phase(name):
@@ -130,11 +142,11 @@ try:
 
         # источник
         if t >= next_spawn:
-            if len(vehicles) < MAX_VEHICLES and try_spawn():
+            if len(vehicles) < max_vehicles and try_spawn():
                 spawned += 1
             else:
                 blocked += 1
-            next_spawn = t + random.expovariate(rate)
+            next_spawn = next_car(t)
 
         # раз в секунду: сток + статистика
         if tick % int(1 / DT) == 0:
@@ -161,9 +173,29 @@ try:
             demand = peds.demand(t)
             print(peds.stats_line(demand))
 
+            # ползунки debug_view.py: потоки и лимиты меняются на лету. Потоки пуассоновские
+            # (без памяти), поэтому пересчитать время следующего появления можно в любой момент
+            for msg, addr in (ctl.poll() if ctl else []):
+                if msg.get("cmd") == "set":
+                    try:
+                        num = lambda key, cur: max(0, int(msg.get(key, cur)))
+                        veh_per_hour = num("veh_per_hour", veh_per_hour)
+                        max_vehicles = num("max_vehicles", max_vehicles)
+                        peds.set_flow(t, num("ped_per_hour", peds.per_hour),
+                                      num("max_per_side", peds.max_per_side))
+                        next_spawn = next_car(t)
+                        print(f"   > управление: машин/ч {veh_per_hour}, макс {max_vehicles}; "
+                              f"пешеходов/ч {peds.per_hour}, на сторону {peds.max_per_side}")
+                    except (TypeError, ValueError):
+                        print(f"   > управление: непонятная команда {msg}")
+                ctl.reply(addr, {"veh_per_hour": veh_per_hour, "max_vehicles": max_vehicles,
+                                 "ped_per_hour": peds.per_hour, "max_per_side": peds.max_per_side})
+
 except KeyboardInterrupt:
     print("\nОстановка...")
 finally:
+    if ctl:
+        ctl.close()
     if peds:
         try:
             peds.destroy()

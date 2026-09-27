@@ -38,6 +38,9 @@ x-app: &app
     WS_PORT: ${WS_PORT:-}
     SEND_PERIOD: ${SEND_PERIOD:-}
     ROAD_LENGTH: ${ROAD_LENGTH:-}
+    # ползунки debug_view.py -> сцена (UDP)
+    CONTROL_HOST: ${CONTROL_HOST:-}
+    CONTROL_PORT: ${CONTROL_PORT:-}
 
 services:
   scene:

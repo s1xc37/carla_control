@@ -50,7 +50,8 @@ GROUP_MIN = 5                 # столько ждущих с одной сто
 MAX_PER_SIDE = env("MAX_PER_SIDE", 3)    # живых пешеходов, пришедших с одной стороны
 NAV_SAMPLES = 10000           # выборок navmesh для поиска точек появления
 DRAW_DEBUG = env("DRAW_DEBUG", True)     # выключить при записи кадров для YOLO
-DEBUG_LIFE = 60.0
+DRAW_PERIOD = 1.0             # сцена перерисовывает зоны раз в столько с симуляции
+DEBUG_LIFE = 60.0             # отдельный запуск pedestrians.py: рисунок живёт столько с
 
 OTHER = {"W": "E", "E": "W"}
 COLOR = {"W": carla.Color(0, 255, 0), "E": carla.Color(0, 120, 255)}
@@ -198,18 +199,16 @@ class Pedestrians:
 
         self._find_geometry()
         self._find_spawn_points()
-        if DRAW_DEBUG:
-            self._draw()
 
         self.bps = list(world.get_blueprint_library().filter("walker.pedestrian.*"))
         self.peds = []
         self.pos = {}           # id тела -> позиция на этом тике
-        self.rate = PED_PER_HOUR / 3600.0
-        self.next_spawn = self.rng.expovariate(self.rate)
+        self.set_flow(0.0, PED_PER_HOUR, MAX_PER_SIDE)   # поток и лимит меняются на лету
         self.spawned = self.blocked = self.failed = 0
         self.crossed = 0
         self.stuck = {"APPROACH": 0, "CROSS": 0, "LEAVE": 0}
         self.done_waits = []
+        self.t_draw = -math.inf   # когда последний раз рисовали зоны
         self.cross_times = []   # фактическое время перехода, с
         self.slow = 0           # переходов дольше расчёта заметно
         self.nudges = 0         # подсадок на бордюр
@@ -252,20 +251,20 @@ class Pedestrians:
             else:
                 raise RuntimeError(f"{s}: нет точек появления — увеличь NAV_SAMPLES")
 
-    def _draw(self):
+    def draw_debug(self, life):
+        """Зебра, торцы, точки ожидания и появления — debug-отрисовкой в мире на life секунд."""
         dbg, up = self.world.debug, carla.Location(z=0.3)
         pl = self.zebra
         for a, b in zip(pl, pl[1:] + pl[:1]):
-            dbg.draw_line(a + up, b + up, thickness=0.08,
-                          color=carla.Color(255, 255, 255), life_time=DEBUG_LIFE)
+            dbg.draw_line(a + up, b + up, thickness=0.15,
+                          color=carla.Color(255, 255, 255), life_time=life)
         for s in ("W", "E"):
-            dbg.draw_point(self.ends[s] + up, size=0.15, color=carla.Color(255, 0, 0),
-                           life_time=DEBUG_LIFE)
-            dbg.draw_point(self.wait[s] + up, size=0.3, color=COLOR[s], life_time=DEBUG_LIFE)
+            dbg.draw_point(self.ends[s] + up, size=0.25, color=carla.Color(255, 0, 0), life_time=life)
+            dbg.draw_point(self.wait[s] + up, size=0.4, color=COLOR[s], life_time=life)
             dbg.draw_string(self.wait[s] + carla.Location(z=2), f"WAIT {s}",
-                            color=COLOR[s], life_time=DEBUG_LIFE)
+                            color=COLOR[s], life_time=life)
             for c in self.cands[s]:
-                dbg.draw_point(c + up, size=0.1, color=COLOR[s], life_time=DEBUG_LIFE)
+                dbg.draw_point(c + up, size=0.15, color=COLOR[s], life_time=life)
 
     # ---- маршруты ----
     def _slot(self, side):
@@ -296,7 +295,7 @@ class Pedestrians:
     # ---- поток ----
     def _spawn_event(self, t):
         n = self.rng.randint(*GROUP_SIZE) if self.rng.random() < GROUP_PROB else 1
-        room = [s for s in ("W", "E") if sum(p.side == s for p in self.peds) + n <= MAX_PER_SIDE]
+        room = [s for s in ("W", "E") if sum(p.side == s for p in self.peds) + n <= self.max_per_side]
         if not room:                     # обе стороны заполнены
             self.blocked += 1
             return
@@ -315,6 +314,13 @@ class Pedestrians:
                 continue
             self.peds.append(Ped(w, side, speed, [slot], t, loc))
             self.spawned += 1
+
+    def set_flow(self, t, per_hour, max_per_side):
+        """Поток (появлений в час) и лимит живых на сторону; 0 — никто не появляется.
+        Уже живые доходят свой путь."""
+        self.per_hour, self.max_per_side = per_hour, max_per_side
+        self.rate = per_hour / 3600.0
+        self.next_spawn = t + self.rng.expovariate(self.rate) if self.rate > 0 else math.inf
 
     # ---- машина состояний, вызывать каждый тик после world.tick() ----
     def update(self, t, phase, phase_left):
@@ -387,9 +393,13 @@ class Pedestrians:
             self.client.apply_batch(cmds)
         if gone:
             self._remove(gone)
+        # рисунок живёт 2 периода: перерисовываем раньше, чем старый погаснет, — без мигания
+        if DRAW_DEBUG and t - self.t_draw >= DRAW_PERIOD:
+            self.draw_debug(2 * DRAW_PERIOD)
+            self.t_draw = t
         if t >= self.next_spawn:
             self._spawn_event(t)
-            self.next_spawn = t + self.rng.expovariate(self.rate)
+            self.next_spawn = t + self.rng.expovariate(self.rate) if self.rate > 0 else math.inf
 
     def _curb(self, p, loc, t):
         """Ручной пешеход не забирается на бордюр у торцов зебры — подсаживаем на 30 см."""
@@ -470,7 +480,7 @@ class Pedestrians:
                 f"ср.ожид {d.mean_wait:3.0f}с (у перешедших {hist:.0f}с) | "
                 f"идут {n['APPROACH']} переходят {n['CROSS']} уходят {n['LEAVE']} | "
                 f"перешло {d.crossed_total} (переход ср/макс {ct}, долгих {self.slow}, подсадок {self.nudges})  +{self.spawned} "
-                f"(лимит {MAX_PER_SIDE} на сторону — не появились {self.blocked}, спавн не удался {self.failed})"
+                f"(лимит {self.max_per_side} на сторону — не появились {self.blocked}, спавн не удался {self.failed})"
                 + (f"  ЗАСТРЯЛИ {self.stuck}" if stuck else ""))
 
     def destroy(self):
@@ -485,7 +495,7 @@ if __name__ == "__main__":
     client.set_timeout(20.0)
     world = client.get_world()
     center = carla.Location(x=32.3, y=-178.5, z=0.0)
-    Pedestrians(world, client, center)
+    Pedestrians(world, client, center).draw_debug(DEBUG_LIFE)
     world.get_spectator().set_transform(carla.Transform(
         center + carla.Location(z=45), carla.Rotation(pitch=-89)))
     print(f"Нарисовано на {DEBUG_LIFE:.0f} с. W — зелёный, E — синий, красные — торцы.")

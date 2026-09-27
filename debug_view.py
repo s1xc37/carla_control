@@ -15,10 +15,12 @@ debug_view.py — отладочное окно: вид сверху на пер
 """
 import argparse
 import math
+import time
 
 import carla
 import pygame
 
+import control
 from envconf import CARLA_HOST, CARLA_PORT
 from ws_sender import Observer
 
@@ -34,6 +36,14 @@ PHASE_COLOR = {"MAIN": (90, 200, 90), "SIDE": (90, 160, 255), "PED": (255, 120, 
 BG, ROAD, ZEBRA, CORRIDOR = (25, 25, 30), (75, 75, 85), (240, 240, 240), (230, 200, 40)
 ZONE = {"W": (0, 200, 0), "E": (0, 120, 255)}
 WALKER, TEXT, DIM = (255, 120, 255), (230, 230, 230), (140, 140, 150)
+
+# ползунки: ключ команды сцене (control.py), подпись, мин, макс, шаг
+SLIDERS = [("veh_per_hour", "машин в час", 0, 3600, 100),
+           ("max_vehicles", "машин максимум", 0, 120, 5),
+           ("ped_per_hour", "пешеходов в час", 0, 1800, 30),
+           ("max_per_side", "пешеходов на сторону (живых)", 0, 8, 1)]
+ROW = 40                                          # высота строки ползунка, px
+CONTROLS_TOP = H - 26 - 34 - ROW * len(SLIDERS)   # где начинается блок управления
 
 
 class View:
@@ -123,13 +133,13 @@ class View:
                               f"пешеходы: W={ped['waiting']['W']} E={ped['waiting']['E']} "
                               f"на зебре={ped['crossing']}", True, TEXT), (x0, y))
         y += 26
-        scr.blit(font.render("   id  тип        x        y  полоса км/ч", True, DIM), (x0, y))
+        scr.blit(font.render("    id  тип        x        y  полоса км/ч", True, DIM), (x0, y))
         y += 20
         for c in s["cars"]:
-            if y > H - 50:
+            if y > CONTROLS_TOP - 20:
                 break
             lane = f"{c['lane'][0]} {c['lane'][1]}" if c["lane"] else "-"
-            row = (f"{'★' if c['lane'] else ' '}{c['id']:>4} {c['type']:<7} "
+            row = (f"{'★' if c['lane'] else ' '}{c['id']:>5} {c['type']:<7} "
                    f"{c['x']:>8.1f} {c['y']:>8.1f}  {lane:<6} {c['kmh']:>4.0f}")
             color = (255, 255, 255) if c is hover else COLOR[c["type"]]
             scr.blit(font.render(row, True, color), (x0, y))
@@ -142,7 +152,86 @@ class View:
             info += f"   | машина {hover['id']} ({hover['type']}): x={hover['x']:.2f} y={hover['y']:.2f} " \
                     f"z={hover['z']:.2f} курс={hover['yaw']:.0f}°"
         pygame.draw.rect(scr, (15, 15, 18), (0, H - 26, MAP_W + PANEL_W, 26))
-        scr.blit(small.render(info + "   (клик — в консоль, колесо — масштаб)", True, TEXT), (10, H - 20))
+        scr.blit(small.render(info + "   (клик — в консоль, колесо — масштаб / ползунок)", True, TEXT), (10, H - 20))
+
+
+class Controls:
+    """Ползунки справа внизу: шлют сцене потоки и лимиты (control.py) и показывают, что она приняла."""
+
+    def __init__(self):
+        self.ctl = control.Client()
+        self.scene = None                     # последние значения, подтверждённые сценой
+        self.values = {}                      # что показываем (пока тянем — своё)
+        self.t_reply = self.t_get = self.hold = -math.inf
+        self.drag = None
+        self.spec = {key: (label, lo, hi, step) for key, label, lo, hi, step in SLIDERS}
+        self.tracks = {key: pygame.Rect(MAP_W + 12, CONTROLS_TOP + 54 + i * ROW, PANEL_W - 24, 6)
+                       for i, (key, *_) in enumerate(SLIDERS)}
+
+    def connected(self, now):
+        return now - self.t_reply < 3.0
+
+    def update(self, now):
+        """Раз в секунду спрашиваем сцену, ответы забираем каждый кадр."""
+        if now - self.t_get > 1.0:
+            self.ctl.send(cmd="get")
+            self.t_get = now
+        reply = self.ctl.latest()
+        if reply:
+            self.scene, self.t_reply = reply, now
+            if self.drag is None and (now > self.hold or reply == self.values):
+                self.values = dict(reply)
+
+    def _value_at(self, key, mx):
+        _, lo, hi, step = self.spec[key]
+        r = self.tracks[key]
+        f = min(1.0, max(0.0, (mx - r.x) / r.w))
+        return int(round((lo + f * (hi - lo)) / step) * step)
+
+    def _hit(self, pos):
+        return next((k for k, r in self.tracks.items() if r.inflate(0, 24).collidepoint(pos)), None)
+
+    def _send(self, now):
+        self.ctl.send(cmd="set", **self.values)
+        self.hold = now + 2.0                 # пока сцена не подтвердила — показываем своё
+
+    def event(self, e, now):
+        """True, если событие забрали ползунки."""
+        if not self.connected(now):
+            return False
+        if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and (k := self._hit(e.pos)):
+            self.drag = k
+            self.values[k] = self._value_at(k, e.pos[0])
+            return True
+        if e.type == pygame.MOUSEMOTION and self.drag:
+            self.values[self.drag] = self._value_at(self.drag, e.pos[0])
+            return True
+        if e.type == pygame.MOUSEBUTTONUP and e.button == 1 and self.drag:
+            self.drag = None
+            self._send(now)                   # шлём, когда отпустили
+            return True
+        if e.type == pygame.MOUSEWHEEL and (k := self._hit(pygame.mouse.get_pos())):
+            _, lo, hi, step = self.spec[k]
+            self.values[k] = min(hi, max(lo, self.values[k] + e.y * step))
+            self._send(now)
+            return True
+        return False
+
+    def draw(self, scr, font, small, now):
+        x0, ok = MAP_W + 12, self.connected(now)
+        pygame.draw.line(scr, DIM, (x0, CONTROLS_TOP), (MAP_W + PANEL_W - 12, CONTROLS_TOP))
+        head = "Управление сценой" if ok else "Управление: сцена не отвечает (run_scene.py запущен?)"
+        scr.blit(font.render(head, True, TEXT if ok else (255, 120, 120)), (x0, CONTROLS_TOP + 8))
+        for key, (label, lo, hi, step) in self.spec.items():
+            r, v = self.tracks[key], self.values.get(key)
+            wait = ok and v != self.scene.get(key)
+            txt = f"{label}: {v if ok else '—'}" + (f"   (сейчас в сцене {self.scene[key]})" if wait else "")
+            scr.blit(small.render(txt, True, TEXT if ok else DIM), (r.x, r.y - 18))
+            pygame.draw.rect(scr, (60, 60, 70), r, border_radius=3)
+            if ok:
+                fx = r.x + r.w * (v - lo) / (hi - lo)
+                pygame.draw.rect(scr, CORRIDOR, (r.x, r.y, fx - r.x, r.h), border_radius=3)
+                pygame.draw.circle(scr, (255, 255, 255) if key == self.drag else CORRIDOR, (fx, r.centery), 7)
 
 
 def main():
@@ -161,12 +250,18 @@ def main():
     mono = pygame.font.match_font("dejavusansmono,liberationmono,monospace")
     font, small = pygame.font.Font(mono, 14), pygame.font.Font(mono, 12)
     clock = pygame.time.Clock()
+    controls = Controls()
+    t_start = time.monotonic()
     try:
         while True:
             s = view.read()
+            now = time.monotonic()
+            controls.update(now)
             for e in pygame.event.get():
                 if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
                     return
+                if controls.event(e, now):
+                    continue
                 if e.type == pygame.MOUSEWHEEL:
                     view.scale = min(40.0, max(2.0, view.scale * (1.15 ** e.y)))
                 if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and e.pos[0] < MAP_W:
@@ -177,8 +272,9 @@ def main():
                         f"z={car['z']:.2f}, курс {car['yaw']:.0f}°, полоса {car['lane']}, "
                         f"{car['kmh']:.0f} км/ч" if car else ""))
             view.draw(scr, font, small, s, pygame.mouse.get_pos())
+            controls.draw(scr, font, small, now)
             pygame.display.flip()
-            if args.screenshot:
+            if args.screenshot and (controls.connected(now) or now - t_start > 3):
                 pygame.image.save(scr, args.screenshot)
                 print(f"Сохранено: {args.screenshot}")
                 return
