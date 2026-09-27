@@ -64,6 +64,10 @@ CARLA — это только «мир»: машины, пешеходы, све
   по WebSocket (`ws://<ip>:8765`, раз в 0.5 с симуляции). Запускать после `run_scene.py`.
   Геометрию зебры берёт из `pedestrians.find_geometry()` — зоны те же, что у пешеходов.
   Фаза определяется по цветам светофоров. Нужна `websockets` (ставить `uv pip install`, в venv нет pip).
+- `Dockerfile`, `docker-compose.yml` — сцена и отправщик в Docker (`docker compose up --build`),
+  сервер CARLA на хосте, `network_mode: host`, `stop_signal: SIGINT` для уборки. Параметры — переменные
+  окружения через `envconf.env()` (список — `.env.example`); `run_scene.py` сам грузит `CARLA_MAP`.
+  Сборка ещё не проверена: на машине разработки нет Docker (requirements проверены в чистом venv).
 - `debug_view.py` — отладочное окно (pygame), тоже только читает мир: вид сверху, машины по габаритам
   с координатами, полосы и коридор JSON (из `ws_sender.Observer`), зоны W/E, координаты под курсором.
 

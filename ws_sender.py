@@ -17,13 +17,14 @@ import math
 import carla
 from websockets.asyncio.server import broadcast, serve
 
+from envconf import CARLA_HOST, CARLA_MAP, CARLA_PORT, env
 from pedestrians import d2, find_geometry
 
 # ---- конфиг ----
 CW_CENTER = carla.Location(x=32.3, y=-178.5, z=0.0)  # центр зебры, как в run_scene.py
-HOST, PORT = "0.0.0.0", 8765
-SEND_PERIOD = 0.5             # раз в столько секунд симуляции
-ROAD_LENGTH = 50.0            # машины на нашей дороге — до столько м от зебры
+HOST, PORT = env("WS_HOST", "0.0.0.0"), env("WS_PORT", 8765)
+SEND_PERIOD = env("SEND_PERIOD", 0.5)     # раз в столько секунд симуляции
+ROAD_LENGTH = env("ROAD_LENGTH", 50.0)    # машины на нашей дороге — до столько м от зебры
 ZEBRA_MARGIN = 2.0            # ... и на самой зебре: до столько м за её дальним краем
 ZONE_HALF = 1.5               # зона ожидания пешеходов — квадрат 3×3 м вокруг точки ожидания
 TICK_TIMEOUT = 10.0           # столько ждём тик мира, с
@@ -155,9 +156,14 @@ class Observer:
 
 
 async def main():
-    client = carla.Client("localhost", 2000)
+    client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(20.0)
     world = client.get_world()
+    # сцена могла ещё не загрузить нужную карту — ждём, иначе геометрия будет не та
+    while CARLA_MAP and CARLA_MAP not in world.get_map().name:
+        print(f"Открыта {world.get_map().name}, жду {CARLA_MAP} (её грузит run_scene.py)...")
+        await asyncio.sleep(3)
+        world = client.get_world()
     obs = Observer(world)
 
     async def handler(ws):

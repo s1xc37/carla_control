@@ -20,12 +20,14 @@ from types import SimpleNamespace
 
 import carla
 
+from envconf import CARLA_HOST, CARLA_PORT, env
+
 # ---- конфиг ----
-PED_PER_HOUR = 360            # появлений в час на обе стороны (группа = одно появление)
+PED_PER_HOUR = env("PED_PER_HOUR", 360)  # появлений в час на обе стороны (группа = одно появление)
 GROUP_PROB = 0.0              # вероятность группы; группы 5–10 не влезают в лимит MAX_PER_SIDE
 GROUP_SIZE = (5, 10)
 GROUP_RADIUS = 2.0            # разброс группы вокруг точки появления, м
-SPEED = (1.2, 1.6)            # м/с
+SPEED = (env("PED_SPEED_MIN", 1.2), env("PED_SPEED_MAX", 1.6))  # м/с
 SPAWN_RING = (20.0, 40.0)     # где появляются: столько м от точки ожидания
 SPAWN_MIN_FALLBACK = 10.0     # если у стороны тротуара на 20 м нет — ближняя граница
 WAIT_OFFSET = 1.0             # точка ожидания: столько м от торца зебры наружу
@@ -34,7 +36,7 @@ SLOT_SPREAD = 1.2             # места у бордюра: разброс в�
 SLOT_BACK = 0.8               # ... и от бордюра назад, м
 LANE_OFFSET = (0.2, 1.0)      # на зебре: встречные идут по разным половинам, м от оси
 ROAD_CLEAR = 0.3              # переход закончен: на столько м за крайней полосой
-CROSS_MARGIN = 2.0            # запас по времени на переход, с
+CROSS_MARGIN = env("CROSS_MARGIN", 2.0)  # запас по времени на переход, с
 REACH = 0.5                   # точка ломаной пройдена, м
 LEAVE_REACH = 1.2             # при уходе точку ожидания проходим с запасом — там могут стоять
 AVOID_DIST = 0.8              # не наступаем на соседа: ближе этого впереди — обходим или ждём, м
@@ -45,9 +47,9 @@ RESLOT = 1.5                  # ждущего оттолкнули дальше
 CURB_ZONE = 3.0               # у торцов зебры бордюр: упёршегося подсаживаем на него, м
 STUCK_TIME = 10.0             # не сдвинулся на 0.5 м за столько секунд — застрял
 GROUP_MIN = 5                 # столько ждущих с одной стороны = группа
-MAX_PER_SIDE = 3              # живых пешеходов, пришедших с одной стороны
+MAX_PER_SIDE = env("MAX_PER_SIDE", 3)    # живых пешеходов, пришедших с одной стороны
 NAV_SAMPLES = 10000           # выборок navmesh для поиска точек появления
-DRAW_DEBUG = True             # выключить при записи кадров для YOLO
+DRAW_DEBUG = env("DRAW_DEBUG", True)     # выключить при записи кадров для YOLO
 DEBUG_LIFE = 60.0
 
 OTHER = {"W": "E", "E": "W"}
@@ -479,7 +481,7 @@ class Pedestrians:
 
 if __name__ == "__main__":
     # только геометрия и отрисовка, никого не спавним
-    client = carla.Client("localhost", 2000)
+    client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(20.0)
     world = client.get_world()
     center = carla.Location(x=32.3, y=-178.5, z=0.0)

@@ -1,17 +1,22 @@
 import math
 import random
+import signal
 import carla
+from envconf import CARLA_HOST, CARLA_MAP, CARLA_PORT, env
 from pedestrians import Pedestrians
 
 # ---- конфиг ----
 CW_CENTER = carla.Location(x=32.3, y=-178.5, z=0.0)  # центр зебры
 SOURCE_RING = (40.0, 150.0)   # где появляются машины
 SINK_RADIUS = 170.0           # дальше — удаляем
-VEH_PER_HOUR = 1200           # интенсивность суммарно по всем подходам
-MAX_VEHICLES = 60             # потолок, чтобы не задушить сервер
-SEED = 42
+VEH_PER_HOUR = env("VEH_PER_HOUR", 1200)   # интенсивность суммарно по всем подходам
+MAX_VEHICLES = env("MAX_VEHICLES", 60)     # потолок, чтобы не задушить сервер
+SEED = env("SEED", 42)
+TM_PORT = env("TM_PORT", 8000)            # порт Traffic Manager
 DT = 0.05
-PHASES = [("MAIN", 20.0), ("SIDE", 15.0), ("PED", 20.0)]  # PED >= время перехода (~14–18 с)
+# длительности фаз, с; PED >= время перехода (~14–18 с)
+PHASES = [("MAIN", env("PHASE_MAIN", 20.0)), ("SIDE", env("PHASE_SIDE", 15.0)),
+          ("PED", env("PHASE_PED", 20.0))]
 
 G, R = carla.TrafficLightState.Green, carla.TrafficLightState.Red
 random.seed(SEED)
@@ -19,10 +24,22 @@ random.seed(SEED)
 def d2(a, b):
     return math.hypot(a.x - b.x, a.y - b.y)
 
-client = carla.Client("localhost", 2000)
+def on_sigterm(*_):  # docker stop шлёт SIGTERM — уходим через ту же уборку, что и Ctrl+C
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTERM, on_sigterm)
+
+client = carla.Client(CARLA_HOST, CARLA_PORT)
 client.set_timeout(20.0)
 world = client.get_world()
-tm = client.get_trafficmanager()
+if CARLA_MAP and CARLA_MAP not in world.get_map().name:
+    print(f"Открыта {world.get_map().name}, загружаю {CARLA_MAP}...")
+    client.set_timeout(120.0)                 # загрузка карты долгая
+    world = client.load_world(CARLA_MAP)
+    client.set_timeout(20.0)
+print(f"Сервер {CARLA_HOST}:{CARLA_PORT}, карта {world.get_map().name}; "
+      f"фазы {', '.join(f'{n} {d:g}с' for n, d in PHASES)}; машин/ч {VEH_PER_HOUR}, SEED {SEED}")
+tm = client.get_trafficmanager(TM_PORT)
 tm.set_random_device_seed(SEED)
 vehicles = []
 peds = None

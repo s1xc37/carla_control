@@ -19,6 +19,7 @@ import math
 import carla
 import pygame
 
+from envconf import CARLA_HOST, CARLA_PORT
 from ws_sender import Observer
 
 # ---- конфиг ----
@@ -149,7 +150,7 @@ def main():
     ap.add_argument("--screenshot", help="сохранить картинку окна в файл и выйти")
     args = ap.parse_args()
 
-    client = carla.Client("localhost", 2000)
+    client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(20.0)
     world = client.get_world()
     view = View(world, Observer(world))

@@ -1,0 +1,50 @@
+# Запуск одной командой (сервер CARLA 0.9.16 уже запущен на хосте):
+#     docker compose up --build
+# Остановка — Ctrl+C один раз: скрипты уберут машины и пешеходов и отпустят мир.
+#
+# Параметры — переменные окружения. Их можно задать в файле .env рядом (образец — .env.example)
+# или прямо в команде:  VEH_PER_HOUR=2000 PHASE_PED=25 docker compose up
+# Не заданная или пустая переменная — берётся значение по умолчанию из кода.
+
+x-app: &app
+  build: .
+  image: smart-crosswalk
+  network_mode: host            # сервер CARLA и порт WebSocket — прямо на хосте (Linux)
+  stop_signal: SIGINT           # как Ctrl+C — срабатывает уборка в скриптах
+  stop_grace_period: 30s
+  restart: on-failure:3         # например, сервер CARLA ещё не поднялся
+  environment:
+    # сервер CARLA
+    CARLA_HOST: ${CARLA_HOST:-}
+    CARLA_PORT: ${CARLA_PORT:-}
+    CARLA_MAP: ${CARLA_MAP:-}
+    TM_PORT: ${TM_PORT:-}
+    # сцена: машины и светофор
+    SEED: ${SEED:-}
+    VEH_PER_HOUR: ${VEH_PER_HOUR:-}
+    MAX_VEHICLES: ${MAX_VEHICLES:-}
+    PHASE_MAIN: ${PHASE_MAIN:-}
+    PHASE_SIDE: ${PHASE_SIDE:-}
+    PHASE_PED: ${PHASE_PED:-}
+    # пешеходы
+    PED_PER_HOUR: ${PED_PER_HOUR:-}
+    MAX_PER_SIDE: ${MAX_PER_SIDE:-}
+    PED_SPEED_MIN: ${PED_SPEED_MIN:-}
+    PED_SPEED_MAX: ${PED_SPEED_MAX:-}
+    CROSS_MARGIN: ${CROSS_MARGIN:-}
+    DRAW_DEBUG: ${DRAW_DEBUG:-}
+    # отправка по WebSocket
+    WS_HOST: ${WS_HOST:-}
+    WS_PORT: ${WS_PORT:-}
+    SEND_PERIOD: ${SEND_PERIOD:-}
+    ROAD_LENGTH: ${ROAD_LENGTH:-}
+
+services:
+  scene:
+    <<: *app
+    command: python run_scene.py
+
+  sender:
+    <<: *app
+    command: python ws_sender.py
+    depends_on: [scene]           # сам дождётся, пока сцена загрузит карту
