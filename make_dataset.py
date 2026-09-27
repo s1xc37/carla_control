@@ -15,13 +15,13 @@ instance segmentation. Instance segmentation кодирует в пикселе 
 
 Результат — формат ultralytics YOLO:
     dataset/data.yaml
-    dataset/images/{train,val}/<камера>_<кадр>.jpg
-    dataset/labels/{train,val}/<камера>_<кадр>.txt   — «класс x_центр y_центр ширина высота», доли кадра
+    dataset/images/{train,val}/<камера>_<запуск>_<кадр>.jpg
+    dataset/labels/{train,val}/<камера>_<запуск>_<кадр>.txt — «класс x_центр y_центр ширина высота», доли кадра
+Повторный запуск дописывает в ту же папку, ничего не затирая; начать заново — удалить dataset/.
     dataset/preview/*.jpg                           — первые кадры с рамками, проверить глазами
 Обучение у друга:  yolo detect train data=dataset/data.yaml model=yolov8n.pt imgsz=1280
 """
 import os
-import queue
 import threading
 import time
 from collections import Counter
@@ -79,6 +79,12 @@ def boxes_from_instance(inst, vehicle_classes):
     return out
 
 
+def rss_mb():
+    """Память этого процесса, МБ — чтобы утечку было видно в выводе."""
+    with open("/proc/self/status") as f:
+        return next(int(line.split()[1]) // 1024 for line in f if line.startswith("VmRSS"))
+
+
 def yolo_lines(boxes, w, h):
     return [f"{CLASSES.index(c)} {(x0 + x1 + 1) / 2 / w:.6f} {(y0 + y1 + 1) / 2 / h:.6f} "
             f"{(x1 - x0 + 1) / w:.6f} {(y1 - y0 + 1) / h:.6f}" for c, x0, y0, x1, y1 in boxes]
@@ -96,7 +102,11 @@ def main():
 
     client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(20.0)
-    world = client.get_world()
+    try:
+        world = client.get_world()
+    except RuntimeError:
+        raise SystemExit(f"Сервер CARLA на {CARLA_HOST}:{CARLA_PORT} не отвечает — запусти ~/simulator/CarlaUE4.sh "
+                         f"и сцену (DRAW_DEBUG=0 python run_scene.py), потом этот скрипт.")
     if not world.get_settings().synchronous_mode:
         print("ВНИМАНИЕ: мир не в синхронном режиме — run_scene.py не запущена? Машин и людей будет мало.")
     obs = Observer(world)
@@ -107,9 +117,13 @@ def main():
         if not hasattr(carla.WeatherParameters, w):
             raise SystemExit(f"Нет такой погоды: {w}")
     old_weather = world.get_weather()
+    run = time.strftime("%m%d%H%M")       # метка запуска: номера кадров после перезапуска сервера повторяются
 
     lib = world.get_blueprint_library()
-    sensors, ready, pending, lock = [], queue.Queue(), {}, threading.Lock()
+    sensors, pending, lock = [], {}, threading.Lock()
+    # Кадры идут быстрее, чем мы их сохраняем (сцена быстрее реального времени). Очередь без предела
+    # съела память, и OOM убил сервер. Поэтому храним только самую свежую пару на камеру, лишние выбрасываем.
+    latest, fresh, dropped = {}, threading.Event(), [0]
 
     def on_image(img, cam, kind):
         """RGB и instance одной камеры приходят отдельно — склеиваем по номеру кадра."""
@@ -117,9 +131,15 @@ def main():
             pair = pending.setdefault((cam, img.frame), {})
             pair[kind] = img
             if len(pair) == 2:
-                ready.put((cam, pending.pop((cam, img.frame))))
+                del pending[(cam, img.frame)]
+                dropped[0] += cam in latest          # прошлую пару не успели сохранить
+                latest[cam] = pair
+                fresh.set()
+            if len(pending) > 8:                     # непарные хвосты не копим
+                for key in sorted(pending, key=lambda k: k[1])[:-4]:
+                    del pending[key]
 
-    saved, empty, boxes_total, per_split, weather_i = 0, 0, Counter(), Counter(), -1
+    saved, empty, boxes_total, per_split, weather_i, last_cam = 0, 0, Counter(), Counter(), -1, None
     previews = Counter()
     try:
         for cam, pose in poses:
@@ -146,12 +166,16 @@ def main():
                 print(f"  погода: {name}")
                 with lock:                                     # кадры старой погоды выкидываем
                     pending.clear()
-                while not ready.empty():
-                    ready.get_nowait()
-            try:
-                cam, pair = ready.get(timeout=30)
-            except queue.Empty:
+                    latest.clear()
+                    fresh.clear()
+            if not fresh.wait(timeout=30):
                 raise SystemExit("30 с нет кадров — сервер или сцена остановились?")
+            with lock:                                         # камеры по очереди
+                cam = next((c for c in latest if c != last_cam), next(iter(latest)))
+                pair = latest.pop(cam)
+                if not latest:
+                    fresh.clear()
+            last_cam = cam
             rgb, inst = pair["rgb"], pair["inst"]
             classes = {v.id: vehicle_type(v.attributes) for v in world.get_actors().filter("vehicle.*")}
             boxes = boxes_from_instance(inst, classes)
@@ -160,7 +184,7 @@ def main():
                     continue                                   # фона уже достаточно
                 empty += 1
             split = "val" if (saved // CHUNK) % DS_VAL_EVERY == DS_VAL_EVERY - 1 else "train"
-            stem = f"{cam}_{rgb.frame:08d}"
+            stem = f"{cam}_{run}_{rgb.frame:08d}"
             picture = Image.fromarray(camera.to_rgb(rgb))
             picture.save(os.path.join(DS_OUT, "images", split, stem + ".jpg"), quality=95)
             with open(os.path.join(DS_OUT, "labels", split, stem + ".txt"), "w") as f:
@@ -176,19 +200,27 @@ def main():
             per_split[split] += 1
             boxes_total.update(c for c, *_ in boxes)
             if saved % 50 == 0:
-                print(f"  {saved}/{DS_IMAGES} кадров, {time.time() - t0:.0f} с, рамок: {dict(boxes_total)}")
+                print(f"  {saved}/{DS_IMAGES} кадров, {time.time() - t0:.0f} с, память {rss_mb()} МБ, "
+                      f"рамок: {dict(boxes_total)}")
     finally:
+        removed = 0
         for s in sensors:
             try:
                 s.stop()
-                s.destroy()
+                removed += bool(s.destroy())         # при недоступном сервере destroy() не бросает, а даёт False
             except RuntimeError as e:
                 print(f"Сенсор {s.id} убрать не удалось: {e}")
+        weather_ok = False
         try:
             world.set_weather(old_weather)
+            client.get_server_version()               # сервер ответил — значит, погода дошла
+            weather_ok = True
         except RuntimeError as e:
             print(f"Погоду вернуть не удалось: {e}")
-        print(f"Сенсоров убрано: {len(sensors)}, погода возвращена.")
+        print(f"Сенсоров убрано: {removed} из {len(sensors)}"
+              + (", погода возвращена." if weather_ok else ", погода НЕ возвращена (сервер не отвечает)."))
+        if dropped[0]:
+            print(f"Пропущено пар кадров (не успевали сохранять, это нормально): {dropped[0]}")
         print(f"Сохранено {saved} кадров (train {per_split['train']}, val {per_split['val']}, без объектов {empty}); "
               f"рамок: {dict(boxes_total)}")
 

@@ -219,3 +219,6 @@ __marimo__/
 
 # синтетический датасет (make_dataset.py)
 dataset/
+# обучение YOLO (train.py): прогоны и веса
+runs/
+*.pt
