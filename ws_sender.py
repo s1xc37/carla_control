@@ -41,6 +41,14 @@ def inside(poly, p):
     return res
 
 
+def vehicle_type(attrs):
+    """Тип машины по атрибутам чертежа CARLA: car / van / truck / bus / special (как в JSON_FORMAT.md)."""
+    base = attrs.get("base_type", "").lower()
+    if attrs.get("special_type") == "emergency":
+        return "special"
+    return base if base in ("van", "truck", "bus") else "car"
+
+
 class Observer:
     """Собирает одно сообщение. Геометрия ищется один раз, дальше мир только читается."""
 
@@ -96,11 +104,7 @@ class Observer:
     def vtype(self, v):
         t = self.types.get(v.id)
         if t is None:
-            a = v.attributes
-            base = a.get("base_type", "").lower()
-            t = ("special" if a.get("special_type") == "emergency"
-                 else base if base in ("van", "truck", "bus") else "car")
-            self.types[v.id] = t
+            t = self.types[v.id] = vehicle_type(v.attributes)
         return t
 
     def _bounds(self):

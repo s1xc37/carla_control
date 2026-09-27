@@ -103,6 +103,7 @@ try:
             v = world.try_spawn_actor(random.choice(bps), sp)
             if v:
                 v.set_autopilot(True, tm.get_port())
+                tm.update_vehicle_lights(v, True)   # фары по погоде и времени суток — ночью в кадре не тёмные машины
                 vehicles.append(v.id)
                 return True
         return False  # все источники заняты — очередь доползла до спавна

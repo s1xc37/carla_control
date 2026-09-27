@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# синтетический датасет (make_dataset.py)
+dataset/
