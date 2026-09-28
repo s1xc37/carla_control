@@ -27,7 +27,7 @@ camera.py — камеры на нашем перекрёстке: ставит 
   http://<ip>:8080/peds.mjpg   — MJPEG-поток: cv2.VideoCapture(url) или source=url в YOLO;
   http://<ip>:8080/peds.jpg    — один последний кадр.
 
-Для кадров под YOLO в сцене нужен DRAW_DEBUG=0 — иначе debug-отрисовка попадёт в кадр.
+Со сценой с DRAW_DEBUG=1 кадры засвечены: белый контур зебры светится для камеры (по умолчанию выключено).
 """
 import argparse
 import io
