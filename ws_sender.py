@@ -15,7 +15,6 @@ import json
 import math
 
 import carla
-from websockets.asyncio.server import broadcast, serve
 
 from envconf import CARLA_HOST, CARLA_MAP, CARLA_PORT, env
 from pedestrians import d2, find_geometry
@@ -139,6 +138,21 @@ class Observer:
                         "speed_kmh": round(math.hypot(vel.x, vel.y) * 3.6, 1)})
         return out
 
+    def queue(self):
+        """Для контроллера фаз: id всех машин в коридоре (для интенсивности) и типы тех,
+        кто ещё не доехал до зебры: к переходу — со стороны стоп-линии, от перекрёстка — с другой."""
+        ids, types = [], []
+        for v in self.world.get_actors().filter("vehicle.*"):
+            p = v.get_location()
+            lane = self.lane_of(p)
+            if lane is None:
+                continue
+            ids.append(v.id)
+            b = self._dot(p, self.center, self.n)
+            if (b > self.half) if lane[1] == "in" else (b < -self.half):
+                types.append(self.vtype(v))
+        return ids, types
+
     def pedestrians(self):
         waiting, crossing = {"W": 0, "E": 0}, 0
         for w in self.world.get_actors().filter("walker.pedestrian.*"):
@@ -156,6 +170,9 @@ class Observer:
 
 
 async def main():
+    # здесь, а не наверху: Observer берут run_scene.py, debug_view.py и camera.py — им websockets не нужна
+    from websockets.asyncio.server import broadcast, serve
+
     client = carla.Client(CARLA_HOST, CARLA_PORT)
     client.set_timeout(20.0)
     world = client.get_world()

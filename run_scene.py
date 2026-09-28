@@ -3,8 +3,10 @@ import random
 import signal
 import carla
 import control
+import controller
 from envconf import CARLA_HOST, CARLA_MAP, CARLA_PORT, env
 from pedestrians import Pedestrians
+from ws_sender import Observer
 
 # ---- конфиг ----
 CW_CENTER = carla.Location(x=32.3, y=-178.5, z=0.0)  # центр зебры
@@ -15,11 +17,11 @@ MAX_VEHICLES = env("MAX_VEHICLES", 60)     # потолок, чтобы не з�
 SEED = env("SEED", 42)
 TM_PORT = env("TM_PORT", 8000)            # порт Traffic Manager
 DT = 0.05
-# длительности фаз, с; PED >= время перехода (~14–18 с)
-PHASES = [("MAIN", env("PHASE_MAIN", 20.0)), ("SIDE", env("PHASE_SIDE", 15.0)),
-          ("PED", env("PHASE_PED", 20.0))]
+# фазы светофора (длительности, режим) — в controller.py
+TRAFFIC_PERIOD = 0.5          # контроллер получает данные «с камеры» так часто, как уходит JSON, с
+INTENSITY_WINDOW = 300.0      # интенсивность нашей дороги — по машинам за столько с
 
-G, R = carla.TrafficLightState.Green, carla.TrafficLightState.Red
+G, Y, R = carla.TrafficLightState.Green, carla.TrafficLightState.Yellow, carla.TrafficLightState.Red
 random.seed(SEED)
 
 def d2(a, b):
@@ -39,7 +41,14 @@ if CARLA_MAP and CARLA_MAP not in world.get_map().name:
     world = client.load_world(CARLA_MAP)
     client.set_timeout(20.0)
 print(f"Сервер {CARLA_HOST}:{CARLA_PORT}, карта {world.get_map().name}; "
-      f"фазы {', '.join(f'{n} {d:g}с' for n, d in PHASES)}; машин/ч {VEH_PER_HOUR}, SEED {SEED}")
+      f"машин/ч {VEH_PER_HOUR}, SEED {SEED}")
+print(f"Светофор: режим {controller.SIGNAL_MODE}; зелёный MAIN {controller.STAGE_S['MAIN']:g}с, "
+      f"SIDE {controller.STAGE_S['SIDE']:g}с, PED {controller.PED_S:g}с, жёлтый {controller.YELLOW_S:g}с, "
+      f"очистка {controller.ALL_RED_AFTER_CARS_S:g}/{controller.ALL_RED_AFTER_PEDS_S:g}с")
+try:
+    signal_ctl = controller.Controller()   # до того, как трогать мир: кривой SIGNAL_MODE — сразу выход
+except ValueError as e:
+    raise SystemExit(f"SIGNAL_MODE: {e}")
 tm = client.get_trafficmanager(TM_PORT)
 tm.set_random_device_seed(SEED)
 vehicles = []
@@ -115,17 +124,41 @@ try:
 
     next_spawn = next_car(0.0)
 
-    # ---- фазы ----
-    def apply_phase(name):
-        our.set_state(G if name == "SIDE" else R)
+    # ---- фазы: решает controller.py, здесь только данные «с камеры» и цвета светофоров ----
+    obs = Observer(world)     # тот же коридор нашей дороги, что уходит в JSON
+    seen = {}                 # id машины в коридоре -> когда увидели впервые (для интенсивности)
+
+    def observe():
+        ids, queue = obs.queue()
+        for vid in ids:
+            seen.setdefault(vid, t)
+        for vid in [v for v, s in seen.items() if t - s > INTENSITY_WINDOW]:
+            del seen[vid]
+        vph = len(seen) * 3600.0 / max(60.0, min(t, INTENSITY_WINDOW))
+        d = peds.demand(t)
+        return controller.Traffic(vehicles=queue, peds_waiting=d.waiting, peds_max_wait=d.max_wait,
+                                  peds_crossing=d.crossing, vph_per_lane=vph / max(1, len(obs.lanes)))
+
+    def phase_name(sig):
+        return f"{sig.phase} {sig.stage}" if sig.phase == "YELLOW" else sig.phase
+
+    def apply_phase(sig):
+        """MAIN/SIDE — едет эта дорога, YELLOW — ей жёлтый, ALL_RED и PED — всем машинам красный."""
+        road = sig.stage if sig.phase == "YELLOW" else sig.phase
+        color = Y if sig.phase == "YELLOW" else G
+        our.set_state(color if road == "SIDE" else R)
         for tl in main_road:
-            tl.set_state(G if name == "MAIN" else R)
-        print(f"\n=== фаза {name} ===")
+            tl.set_state(color if road == "MAIN" else R)
+        why = f"  ({signal_ctl.last_change})" if sig.phase == "YELLOW" else ""
+        print(f"\n=== фаза {phase_name(sig)} ==={why}")
 
     our_stops = [w.transform.location for w in our.get_stop_waypoints()]
-    phase_i, t_phase, t, tick = 0, 0.0, 0.0, 0
+    t_phase, t, tick = 0.0, 0.0, 0
     spawned = removed = blocked = 0
-    apply_phase(PHASES[0][0])
+    traffic = controller.Traffic()
+    sig = signal_ctl.step(0.0, traffic)
+    name = phase_name(sig)
+    apply_phase(sig)
 
     while True:
         world.tick()
@@ -133,12 +166,14 @@ try:
         t += DT
         t_phase += DT
 
-        if t_phase >= PHASES[phase_i][1]:
-            phase_i = (phase_i + 1) % len(PHASES)
-            t_phase = 0.0
-            apply_phase(PHASES[phase_i][0])
+        if tick % round(TRAFFIC_PERIOD / DT) == 0:
+            traffic = observe()
+        sig = signal_ctl.step(DT, traffic)
+        if phase_name(sig) != name:
+            name, t_phase = phase_name(sig), 0.0
+            apply_phase(sig)
 
-        peds.update(t, PHASES[phase_i][0], PHASES[phase_i][1] - t_phase)
+        peds.update(t, sig.phase, sig.ped_left)
 
         # источник
         if t >= next_spawn:
@@ -166,30 +201,41 @@ try:
                 if math.hypot(vel.x, vel.y) < 0.5 and any(
                         d2(v.get_location(), s) < 25 for s in our_stops):
                     waiting += 1
-            print(f"[{PHASES[phase_i][0]:4} {t_phase:4.0f}s] наш={our.state}  "
+            print(f"[{name:11} {t_phase:4.0f}s] наш={our.state}  "
                   f"в зоне={len(vehicles):3}  ждут у нас={waiting:2}  "
                   f"+{spawned} -{removed} (не влезло {blocked})")
-            # спрос пешеходов — данные для контроллера (пока цикл фиксированный)
             demand = peds.demand(t)
             print(peds.stats_line(demand))
+            print(f"   светофор [{signal_ctl.mode}]: {signal_ctl.reason}  | камера: машин до зебры "
+                  f"{len(traffic.vehicles)}, {traffic.vph_per_lane:.0f} авт/ч на полосу")
 
-            # ползунки debug_view.py: потоки и лимиты меняются на лету. Потоки пуассоновские
+            # debug_view.py: потоки, лимиты и режим светофора меняются на лету. Потоки пуассоновские
             # (без памяти), поэтому пересчитать время следующего появления можно в любой момент
             for msg, addr in (ctl.poll() if ctl else []):
                 if msg.get("cmd") == "set":
                     try:
-                        num = lambda key, cur: max(0, int(msg.get(key, cur)))
-                        veh_per_hour = num("veh_per_hour", veh_per_hour)
-                        max_vehicles = num("max_vehicles", max_vehicles)
-                        peds.set_flow(t, num("ped_per_hour", peds.per_hour),
-                                      num("max_per_side", peds.max_per_side))
-                        next_spawn = next_car(t)
-                        print(f"   > управление: машин/ч {veh_per_hour}, макс {max_vehicles}; "
-                              f"пешеходов/ч {peds.per_hour}, на сторону {peds.max_per_side}")
-                    except (TypeError, ValueError):
-                        print(f"   > управление: непонятная команда {msg}")
+                        if any(k in msg for k in control.FLOW_KEYS):
+                            num = lambda key, cur: max(0, int(msg.get(key, cur)))
+                            veh_per_hour = num("veh_per_hour", veh_per_hour)
+                            max_vehicles = num("max_vehicles", max_vehicles)
+                            peds.set_flow(t, num("ped_per_hour", peds.per_hour),
+                                          num("max_per_side", peds.max_per_side))
+                            next_spawn = next_car(t)
+                            print(f"   > управление: машин/ч {veh_per_hour}, макс {max_vehicles}; "
+                                  f"пешеходов/ч {peds.per_hour}, на сторону {peds.max_per_side}")
+                        if "signal_mode" in msg:
+                            signal_ctl.set_mode(msg["signal_mode"])
+                        if "manual_phase" in msg:
+                            signal_ctl.set_manual(msg["manual_phase"])
+                        if any(k in msg for k in control.SIGNAL_KEYS):
+                            print(f"   > управление: режим светофора {signal_ctl.mode}"
+                                  + (f", фаза {signal_ctl.manual}" if signal_ctl.mode == "manual" else ""))
+                    except (TypeError, ValueError) as e:
+                        print(f"   > управление: непонятная команда {msg} ({e})")
                 ctl.reply(addr, {"veh_per_hour": veh_per_hour, "max_vehicles": max_vehicles,
-                                 "ped_per_hour": peds.per_hour, "max_per_side": peds.max_per_side})
+                                 "ped_per_hour": peds.per_hour, "max_per_side": peds.max_per_side,
+                                 "signal_mode": signal_ctl.mode, "manual_phase": signal_ctl.manual,
+                                 "phase": name, "reason": signal_ctl.reason})
 
 except KeyboardInterrupt:
     print("\nОстановка...")

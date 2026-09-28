@@ -167,6 +167,7 @@ class PedDemand:
     mean_wait: float        # среднее текущее ожидание, с
     group_side: str | None  # сторона, где ждут >= GROUP_MIN, иначе None
     crossed_total: int
+    crossing: int           # сейчас идут по проезжей части (CROSS)
 
 
 class Ped:
@@ -466,7 +467,8 @@ class Pedestrians:
             max_wait={s: max(w, default=0.0) for s, w in waits.items()},
             mean_wait=sum(allw) / len(allw) if allw else 0.0,
             group_side=max(big, key=lambda s: len(waits[s])) if big else None,
-            crossed_total=self.crossed)
+            crossed_total=self.crossed,
+            crossing=sum(p.state == "CROSS" for p in self.peds))
 
     def stats_line(self, d):
         n = {s: sum(p.state == s for p in self.peds) for s in ("APPROACH", "CROSS", "LEAVE")}

@@ -9,18 +9,22 @@ debug_view.py — отладочное окно: вид сверху на пер
 жёлтая рамка — коридор нашей дороги (машины в нём попадают в JSON), машины по габаритам
 (цвет — тип), пешеходы (розовые точки).
 Справа — таблица машин: id, тип, x, y, полоса, км/ч; ★ — машина попадает в JSON.
+Справа внизу — управление сценой: режим светофора и ручная фаза (кнопки), почему горит то,
+что горит, потоки машин и пешеходов (ползунки).
 Внизу — координаты мира под курсором. Клик — печатает их (и машину под курсором) в консоль.
 Колесо мыши — масштаб, Esc — выход.
 Ориентация как у камеры, которую run_scene.py ставит над перекрёстком: +x вверх, +y вправо.
 """
 import argparse
 import math
+import textwrap
 import time
 
 import carla
 import pygame
 
 import control
+from controller import MANUAL_PHASES, MODES
 from envconf import CARLA_HOST, CARLA_PORT
 from ws_sender import Observer
 
@@ -32,7 +36,8 @@ FPS = 15
 
 COLOR = {"car": (170, 170, 170), "van": (110, 170, 255), "truck": (255, 160, 60),
          "bus": (255, 220, 0), "special": (255, 60, 60)}
-PHASE_COLOR = {"MAIN": (90, 200, 90), "SIDE": (90, 160, 255), "PED": (255, 120, 255)}
+PHASE_COLOR = {"MAIN": (90, 200, 90), "SIDE": (90, 160, 255), "PED": (255, 120, 255),
+               "YELLOW": (255, 200, 0), "ALL_RED": (255, 80, 80)}
 BG, ROAD, ZEBRA, CORRIDOR = (25, 25, 30), (75, 75, 85), (240, 240, 240), (230, 200, 40)
 ZONE = {"W": (0, 200, 0), "E": (0, 120, 255)}
 WALKER, TEXT, DIM = (255, 120, 255), (230, 230, 230), (140, 140, 150)
@@ -43,7 +48,9 @@ SLIDERS = [("veh_per_hour", "машин в час", 0, 3600, 100),
            ("ped_per_hour", "пешеходов в час", 0, 1800, 30),
            ("max_per_side", "пешеходов на сторону (живых)", 0, 8, 1)]
 ROW = 40                                          # высота строки ползунка, px
-CONTROLS_TOP = H - 26 - 34 - ROW * len(SLIDERS)   # где начинается блок управления
+MODE_LABEL = {"cycle": "цикл", "button": "кнопка", "adaptive": "адаптив", "manual": "ручной"}
+MODE_H = 96                                       # кнопки режима, ручной фазы и причина, px
+CONTROLS_TOP = H - 26 - 34 - MODE_H - ROW * len(SLIDERS)   # где начинается блок управления
 
 
 class View:
@@ -124,7 +131,7 @@ class View:
         # ---- панель справа ----
         pygame.draw.rect(scr, (15, 15, 18), (MAP_W, 0, PANEL_W, H))
         x0, y = MAP_W + 12, 10
-        scr.blit(font.render(f"Фаза {s['phase']}", True, PHASE_COLOR[s["phase"]]), (x0, y))
+        scr.blit(font.render(f"Фаза {s['phase']}", True, PHASE_COLOR.get(s["phase"].split()[0], TEXT)), (x0, y))
         scr.blit(small.render(f"t={s['t']:.1f} с   кадр {s['frame']}", True, DIM), (x0 + 170, y + 3))
         y += 26
         ped = s["counts"]
@@ -156,7 +163,8 @@ class View:
 
 
 class Controls:
-    """Ползунки справа внизу: шлют сцене потоки и лимиты (control.py) и показывают, что она приняла."""
+    """Справа внизу: режим светофора и ручная фаза (кнопки), потоки и лимиты (ползунки).
+    Шлют сцене команды (control.py) и показывают, что она приняла."""
 
     def __init__(self):
         self.ctl = control.Client()
@@ -165,8 +173,13 @@ class Controls:
         self.t_reply = self.t_get = self.hold = -math.inf
         self.drag = None
         self.spec = {key: (label, lo, hi, step) for key, label, lo, hi, step in SLIDERS}
-        self.tracks = {key: pygame.Rect(MAP_W + 12, CONTROLS_TOP + 54 + i * ROW, PANEL_W - 24, 6)
+        self.tracks = {key: pygame.Rect(MAP_W + 12, CONTROLS_TOP + 54 + MODE_H + i * ROW, PANEL_W - 24, 6)
                        for i, (key, *_) in enumerate(SLIDERS)}
+        # кнопки: режим — строкой, ниже ручная фаза (клик по ней сам включает ручной режим)
+        w = (PANEL_W - 24 - 3 * 6) // 4
+        row = lambda y, names: {n: pygame.Rect(MAP_W + 12 + i * (w + 6), y, w, 22) for i, n in enumerate(names)}
+        self.buttons = {("signal_mode", m): r for m, r in row(CONTROLS_TOP + 32, MODES).items()}
+        self.buttons |= {("manual_phase", p): r for p, r in row(CONTROLS_TOP + 60, MANUAL_PHASES).items()}
 
     def connected(self, now):
         return now - self.t_reply < 3.0
@@ -192,13 +205,19 @@ class Controls:
         return next((k for k, r in self.tracks.items() if r.inflate(0, 24).collidepoint(pos)), None)
 
     def _send(self, now):
-        self.ctl.send(cmd="set", **self.values)
+        self.ctl.send(cmd="set", **{k: self.values[k] for k in self.spec})
         self.hold = now + 2.0                 # пока сцена не подтвердила — показываем своё
 
     def event(self, e, now):
-        """True, если событие забрали ползунки."""
+        """True, если событие забрали кнопки или ползунки."""
         if not self.connected(now):
             return False
+        if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
+            hit = next((kv for kv, r in self.buttons.items() if r.collidepoint(e.pos)), None)
+            if hit:
+                self.ctl.send(cmd="set", **{hit[0]: hit[1]})
+                self.t_get = -math.inf        # сразу спросить сцену — кнопка подсветится быстрее
+                return True
         if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and (k := self._hit(e.pos)):
             self.drag = k
             self.values[k] = self._value_at(k, e.pos[0])
@@ -222,6 +241,17 @@ class Controls:
         pygame.draw.line(scr, DIM, (x0, CONTROLS_TOP), (MAP_W + PANEL_W - 12, CONTROLS_TOP))
         head = "Управление сценой" if ok else "Управление: сцена не отвечает (run_scene.py запущен?)"
         scr.blit(font.render(head, True, TEXT if ok else (255, 120, 120)), (x0, CONTROLS_TOP + 8))
+        mode = self.scene.get("signal_mode") if ok else None
+        for (key, val), r in self.buttons.items():
+            on = val == mode if key == "signal_mode" else mode == "manual" and val == self.scene.get("manual_phase")
+            pygame.draw.rect(scr, CORRIDOR if on else (60, 60, 70), r, border_radius=4)
+            label = small.render(MODE_LABEL.get(val, val), True, (0, 0, 0) if on else (TEXT if ok else DIM))
+            scr.blit(label, label.get_rect(center=r.center))
+        if ok and self.scene.get("reason"):   # почему горит то, что горит, — в две строки
+            width = (PANEL_W - 24) // small.size("x")[0]
+            for i, line in enumerate(textwrap.wrap(f"{self.scene.get('phase', '')}: "
+                                                   f"{self.scene.get('reason', '')}", width)[:2]):
+                scr.blit(small.render(line, True, DIM), (x0, CONTROLS_TOP + 88 + i * 15))
         for key, (label, lo, hi, step) in self.spec.items():
             r, v = self.tracks[key], self.values.get(key)
             wait = ok and v != self.scene.get(key)
@@ -257,6 +287,8 @@ def main():
             s = view.read()
             now = time.monotonic()
             controls.update(now)
+            if controls.connected(now):       # по цветам очистку (всем красный) не отличить от PED
+                s["phase"] = controls.scene.get("phase", s["phase"])
             for e in pygame.event.get():
                 if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
                     return

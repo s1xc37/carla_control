@@ -1,8 +1,10 @@
 """
 control.py — управление сценой на лету по UDP: debug_view.py крутит ползунки, run_scene.py слушает.
 
-Сообщения — JSON: {"cmd": "get"} или {"cmd": "set", "veh_per_hour": 1500, ...}.
-На оба сцена отвечает текущими значениями всех KEYS.
+Сообщения — JSON: {"cmd": "get"}, {"cmd": "set", "veh_per_hour": 1500, ...},
+{"cmd": "set", "signal_mode": "adaptive"}, {"cmd": "set", "manual_phase": "PED"}.
+На все сцена отвечает текущими значениями FLOW_KEYS и SIGNAL_KEYS, плюс phase и reason —
+что горит сейчас и почему (только чтение).
 """
 import json
 import socket
@@ -11,7 +13,8 @@ from envconf import env
 
 CONTROL_HOST = env("CONTROL_HOST", "127.0.0.1")   # 127.0.0.1 — управлять можно только с этой машины
 CONTROL_PORT = env("CONTROL_PORT", 8770)
-KEYS = ("veh_per_hour", "max_vehicles", "ped_per_hour", "max_per_side")
+FLOW_KEYS = ("veh_per_hour", "max_vehicles", "ped_per_hour", "max_per_side")   # потоки, целые числа
+SIGNAL_KEYS = ("signal_mode", "manual_phase")   # режим светофора (controller.MODES) и ручная фаза
 
 
 class Server:
